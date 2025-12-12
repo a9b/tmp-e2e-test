@@ -34,6 +34,8 @@ export class RandomWalker {
   private visitedUrls: Set<string> = new Set();
   private stepCount: number = 0;
   private launcher: BrowserLauncher;
+  /** ページごとの実行済みアクションを追跡（URL -> 実行済みアクション名のSet） */
+  private executedActionsByPage: Map<string, Set<string>> = new Map();
 
   constructor(launcher: BrowserLauncher, config: WalkerConfig = {}) {
     this.launcher = launcher;
@@ -90,8 +92,34 @@ export class RandomWalker {
           break;
         }
 
+        // ベースURLを取得（店舗詳細ページのサブページも同じベースで追跡）
+        const baseUrl = this.getBaseUrl(currentUrl);
+        
+        // 実行済みアクションを取得（ベースURLで追跡）
+        const executedActions = this.executedActionsByPage.get(baseUrl) || new Set<string>();
+        
+        // 未実行のアクションをフィルタリング（順序順の場合）
+        let actionsToChooseFrom = executableActions;
+        if (!this.config.randomOrder) {
+          const unexecutedActions = executableActions.filter(
+            action => !executedActions.has(action.name)
+          );
+          if (unexecutedActions.length > 0) {
+            actionsToChooseFrom = unexecutedActions;
+            logger.debug('未実行のアクション', { 
+              count: unexecutedActions.length,
+              names: unexecutedActions.map(a => a.name)
+            });
+          } else {
+            // すべて実行済みの場合、リセットして最初から
+            logger.info('すべてのアクションが実行済みです。リセットして最初から実行します', { url: baseUrl });
+            this.executedActionsByPage.delete(baseUrl);
+            actionsToChooseFrom = executableActions;
+          }
+        }
+
         // アクションを選択
-        const selectedAction = this.selectAction(executableActions);
+        const selectedAction = this.selectAction(actionsToChooseFrom, baseUrl);
         if (!selectedAction) {
           logger.warn('アクションの選択に失敗しました');
           break;
@@ -116,6 +144,12 @@ export class RandomWalker {
         if (result.success) {
           this.stepCount++;
           
+          // 実行済みアクションとして記録（ベースURLで追跡）
+          if (!this.executedActionsByPage.has(baseUrl)) {
+            this.executedActionsByPage.set(baseUrl, new Set());
+          }
+          this.executedActionsByPage.get(baseUrl)!.add(selectedAction.name);
+          
           // URLが変更された場合、訪問済みURLに追加
           if (result.url && result.url !== currentUrl) {
             // 訪問済みURLの上限チェック
@@ -136,6 +170,11 @@ export class RandomWalker {
         } else {
           logger.warn(`アクション実行失敗: ${selectedAction.name}`, { message: result.message });
           this.stepCount++;
+          // 失敗した場合も実行済みとして記録（無限ループを防ぐため）
+          if (!this.executedActionsByPage.has(baseUrl)) {
+            this.executedActionsByPage.set(baseUrl, new Set());
+          }
+          this.executedActionsByPage.get(baseUrl)!.add(selectedAction.name);
         }
 
         // エラー時のスクリーンショット保存（将来の拡張用）
@@ -169,7 +208,7 @@ export class RandomWalker {
   /**
    * アクションを選択（ランダムまたは順序順）
    */
-  private selectAction(actions: Action[]): Action | null {
+  private selectAction(actions: Action[], currentUrl: string): Action | null {
     if (actions.length === 0) {
       return null;
     }
@@ -177,14 +216,23 @@ export class RandomWalker {
     // 必須アクションを優先
     const requiredActions = actions.filter(a => a.required);
     if (requiredActions.length > 0) {
-      return this.config.randomOrder
-        ? randomChoice(requiredActions)
-        : requiredActions[0];
+      if (this.config.randomOrder) {
+        return randomChoice(requiredActions);
+      } else {
+        // 順序順の場合、実行済みでない必須アクションを選択
+        const executedActions = this.executedActionsByPage.get(currentUrl) || new Set<string>();
+        const unexecutedRequired = requiredActions.filter(a => !executedActions.has(a.name));
+        return unexecutedRequired.length > 0 ? unexecutedRequired[0] : requiredActions[0];
+      }
     }
 
     // ランダム順序の場合はシャッフル
-    const actionsToUse = this.config.randomOrder ? shuffle([...actions]) : actions;
-    return actionsToUse[0];
+    if (this.config.randomOrder) {
+      return randomChoice(actions);
+    } else {
+      // 順序順の場合は、最初のアクションを返す（呼び出し側で未実行のアクションにフィルタリング済み）
+      return actions[0];
+    }
   }
 
   /**
@@ -203,6 +251,29 @@ export class RandomWalker {
       }
     }
     return null;
+  }
+
+  /**
+   * ベースURLを取得（店舗詳細ページのサブページも同じベースで追跡）
+   * 店舗IDを抽出して、同じ店舗のページは同じベースURLとして扱う
+   */
+  private getBaseUrl(url: string): string {
+    // 店舗IDを抽出（UUID形式: c929a5a4-5cc6-4f14-9615-9afeb8156017）
+    const shopIdMatch = url.match(/\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+    if (shopIdMatch) {
+      const shopId = shopIdMatch[1];
+      // 店舗IDをベースとして使用
+      return `shop-${shopId}`;
+    }
+    
+    // shop-detailを含むURLの場合、ベースURLを抽出
+    const shopDetailMatch = url.match(/^(https?:\/\/[^\/]+\/[^\/]+\/shop-detail\/[^\/]+)/);
+    if (shopDetailMatch) {
+      return shopDetailMatch[1] + '/';
+    }
+    
+    // それ以外はそのまま返す
+    return url;
   }
 
   /**

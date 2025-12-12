@@ -18,33 +18,159 @@ function createClickAction(
       try {
         logger.logAction(name, selector);
         
-        // 要素が存在するか確認
-        const element = await page.locator(selector).first();
-        const isVisible = await element.isVisible().catch(() => false);
+        const beforeUrl = page.url();
         
-        if (!isVisible) {
+        // 店舗トップの場合、既にトップページにいる場合はスキップ（ただし、他のページから戻る場合は実行）
+        if (name === '店舗トップ') {
+          const shopDetailMatch = beforeUrl.match(/\/shop-detail\/[^\/]+\/?$/);
+          const hasSubPath = beforeUrl.match(/\/shop-detail\/[^\/]+\/.+/);
+          if (shopDetailMatch && !hasSubPath) {
+            // 既にトップページにいて、サブパスがない場合はスキップ
+            logger.debug('既に店舗トップページにいます。スキップします');
+            return {
+              success: true,
+              message: '既に店舗トップページにいます',
+              url: beforeUrl,
+            };
+          }
+        }
+        
+        // 「ニュース」の場合、data-detail-tab属性を持つ要素を最初に探す（「セラピスト」は特別処理で処理済み）
+        if (name === 'ニュース') {
+          try {
+            const tabValue = 'news';
+            const tabSelectors = [
+              `[data-detail-tab="${tabValue}"]`,
+              `a[data-detail-tab="${tabValue}"]`,
+              `.tab_box[data-detail-tab="${tabValue}"]`,
+            ];
+            
+            for (const tabSelector of tabSelectors) {
+              const tabElement = page.locator(tabSelector).first();
+              const tabCount = await tabElement.count();
+              if (tabCount > 0) {
+                const tabVisible = await tabElement.isVisible({ timeout: 2000 }).catch(() => false);
+                if (tabVisible) {
+                  // タブ要素が見つかった場合、それを使用
+                  await tabElement.scrollIntoViewIfNeeded();
+                  await page.waitForTimeout(300);
+                  try {
+                    await tabElement.click({ timeout: 5000, force: false });
+                  } catch (clickError) {
+                    if (clickError instanceof Error && clickError.message.includes('intercepts')) {
+                      await tabElement.click({ timeout: 5000, force: true });
+                    } else {
+                      throw clickError;
+                    }
+                  }
+                  await page.waitForTimeout(1000);
+                  try {
+                    await page.waitForSelector(`[data-detail-tab="${tabValue}"].detail-current`, { timeout: 3000 });
+                    logger.debug(`タブが切り替わりました: ${tabValue}`);
+                  } catch {
+                    // タブの切り替えを待てない場合は無視
+                  }
+                  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+                  const afterUrl = page.url();
+                  logger.logNavigation(tabSelector, afterUrl);
+                  return {
+                    success: true,
+                    message: `${name}をクリックしました`,
+                    url: afterUrl,
+                  };
+                }
+              }
+            }
+          } catch (error) {
+            logger.debug('タブ要素の検索に失敗しました。通常のクリック処理を続行します', error);
+            // タブ要素の検索に失敗した場合は通常のクリック処理を続行
+          }
+        }
+        
+        // 要素が存在するか確認
+        const element = page.locator(selector).first();
+        const count = await element.count();
+        
+        if (count === 0) {
           logger.warn(`要素が見つかりません: ${selector}`);
           return {
             success: false,
             message: `要素が見つかりません: ${selector}`,
           };
         }
+        
+        const isVisible = await element.isVisible({ timeout: 3000 }).catch(() => false);
+        
+        if (!isVisible) {
+          logger.warn(`要素が表示されていません: ${selector}`);
+          return {
+            success: false,
+            message: `要素が表示されていません: ${selector}`,
+          };
+        }
 
+        // スクロールしてからクリック
+        await element.scrollIntoViewIfNeeded();
+        await page.waitForTimeout(300); // 少し待機
+        
+        // タブ切り替えの可能性がある場合は、data-detail-tab属性を確認
+        let isTabSwitch = await element.getAttribute('data-detail-tab').catch(() => null);
+        
+        // 要素自体に属性がない場合、親要素を確認
+        if (!isTabSwitch) {
+          try {
+            const parent = element.locator('..');
+            isTabSwitch = await parent.getAttribute('data-detail-tab').catch(() => null);
+          } catch {
+            // 親要素の取得に失敗した場合は無視
+          }
+        }
+        
+        
         // クリック実行
-        await element.click({ timeout: 5000 });
+        try {
+          await element.click({ timeout: 5000, force: false });
+        } catch (clickError) {
+          // クリックが失敗した場合、forceオプションで再試行
+          if (clickError instanceof Error && clickError.message.includes('intercepts')) {
+            logger.debug('要素が他の要素に隠れています。forceオプションで再試行します');
+            await element.click({ timeout: 5000, force: true });
+          } else {
+            throw clickError;
+          }
+        }
         
         // ページ遷移を待機
+        await page.waitForTimeout(1000); // 遷移を待つ
+        
+        // タブ切り替えの場合は、タブがアクティブになるまで待機
+        if (isTabSwitch) {
+          try {
+            await page.waitForSelector(`[data-detail-tab="${isTabSwitch}"].detail-current`, { timeout: 3000 });
+            logger.debug(`タブが切り替わりました: ${isTabSwitch}`);
+          } catch {
+            // タブの切り替えを待てない場合は無視
+          }
+        }
+        
         await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
           // ネットワークアイドルを待てない場合は無視
         });
 
-        const currentUrl = page.url();
-        logger.logNavigation(selector, currentUrl);
+        const afterUrl = page.url();
+        
+        // URLが変わったか確認（タブ切り替えの場合はURLが変わらないこともある）
+        if (beforeUrl === afterUrl && name !== '店舗トップ' && !isTabSwitch) {
+          logger.debug(`URLが変更されませんでしたが、タブ切り替えの可能性があります: ${name}`, { beforeUrl, afterUrl });
+          // URLが変わらなくても成功として扱う（タブ切り替えなどの場合）
+        }
+        
+        logger.logNavigation(selector, afterUrl);
 
         return {
           success: true,
           message: `${name}をクリックしました`,
-          url: currentUrl,
+          url: afterUrl,
         };
       } catch (error) {
         logger.error(`アクション実行エラー: ${name}`, error);
@@ -240,6 +366,7 @@ const findMonroeAction: Action = {
 /**
  * 店舗詳細ページのアクション定義
  * 別ファイルで管理しやすくするため、配列として定義
+ * 順序: 店舗トップ → セラピスト → 料金システム → 割引情報 → ニュース → セラピスト動画 → アクセス
  */
 export const monroeShopActions: Action[] = [
   createClickAction(
@@ -248,18 +375,245 @@ export const monroeShopActions: Action[] = [
       'a:has-text("店舗トップ")',
       'text=店舗トップ',
       '[href*="top"]',
+      '[data-detail-tab="top"]',
+      'a[data-detail-tab="top"]',
     ],
     '店舗トップページに遷移'
   ),
-  createClickAction(
-    'ニュース セラピスト',
-    [
-      'a:has-text("ニュース セラピスト")',
+  // セラピストは特別処理でdata-detail-tab属性を持つ要素を直接探す
+  {
+    name: 'セラピスト',
+    selectors: [
+      '[data-detail-tab="therapist"]',
+      'a[data-detail-tab="therapist"]',
+      'a.tab_box[data-detail-tab="therapist"]',
+      '.tab_box[data-detail-tab="therapist"]',
       'text=ニュース セラピスト',
-      '[href*="news"]',
+      'a:has-text("ニュース セラピスト")',
+      'a:has-text("セラピスト")',
       '[href*="therapist"]',
     ],
-    'ニュース セラピストページに遷移'
+    description: 'セラピストページに遷移（タブ切り替え）',
+    execute: async (page: Page, selector: string): Promise<ActionResult> => {
+      try {
+        logger.logAction('セラピスト', selector);
+        const beforeUrl = page.url();
+        
+        // data-detail-tab属性を持つ要素を最初に探す（セレクタに関係なく）
+        const tabSelectors = [
+          '[data-detail-tab="therapist"]',
+          'a[data-detail-tab="therapist"]',
+          '.tab_box[data-detail-tab="therapist"]',
+          'a.tab_box[data-detail-tab="therapist"]',
+        ];
+        
+        logger.debug('セラピストのタブ要素を検索中...');
+        for (const tabSelector of tabSelectors) {
+          try {
+            const tabElement = page.locator(tabSelector).first();
+            const tabCount = await tabElement.count();
+            logger.debug(`タブセレクタ ${tabSelector} の要素数: ${tabCount}`);
+            if (tabCount > 0) {
+              const tabVisible = await tabElement.isVisible({ timeout: 3000 }).catch(() => false);
+              logger.debug(`タブ要素の表示状態: ${tabVisible}`);
+              if (tabVisible) {
+                // タブ要素が見つかった場合、それを使用
+                logger.info(`タブ要素が見つかりました: ${tabSelector}`);
+                await tabElement.scrollIntoViewIfNeeded();
+                await page.waitForTimeout(500);
+                try {
+                  await tabElement.click({ timeout: 5000, force: false });
+                  logger.debug('タブ要素をクリックしました');
+                } catch (clickError) {
+                  if (clickError instanceof Error && clickError.message.includes('intercepts')) {
+                    logger.debug('要素が他の要素に隠れています。forceオプションで再試行します');
+                    await tabElement.click({ timeout: 5000, force: true });
+                  } else {
+                    throw clickError;
+                  }
+                }
+                await page.waitForTimeout(1500);
+                try {
+                  await page.waitForSelector('[data-detail-tab="therapist"].detail-current', { timeout: 5000 });
+                  logger.info(`タブが切り替わりました: therapist`);
+                } catch {
+                  logger.debug('タブの切り替えを待てませんでしたが、続行します');
+                }
+                await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+                const afterUrl = page.url();
+                logger.logNavigation(tabSelector, afterUrl);
+                return {
+                  success: true,
+                  message: 'セラピストをクリックしました',
+                  url: afterUrl,
+                };
+              }
+            }
+          } catch (error) {
+            logger.debug(`タブセレクタ ${tabSelector} の検索でエラー`, error);
+            // 次のセレクタを試す
+          }
+        }
+        
+        // data-detail-tab属性が見つからない場合、すべてのタブ要素を探して「セラピスト」を含むものを探す
+        logger.debug('すべてのタブ要素を探して「セラピスト」を含むものを探します');
+        try {
+          // すべてのタブ要素を取得
+          const allTabElements = await page.locator('.tab_box, [data-detail-tab]').all();
+          logger.debug(`タブ要素の総数: ${allTabElements.length}`);
+          
+          for (const tabElement of allTabElements) {
+            try {
+              const text = await tabElement.textContent().catch(() => '');
+              const dataAttr = await tabElement.getAttribute('data-detail-tab').catch(() => null);
+              const classAttr = await tabElement.getAttribute('class').catch(() => null);
+              
+              logger.debug(`タブ要素: text=${text?.substring(0, 20)}, data-detail-tab=${dataAttr}, class=${classAttr}`);
+              
+              if ((text && (text.includes('セラピスト') || text.includes('therapist'))) || 
+                  dataAttr === 'therapist' ||
+                  (classAttr && classAttr.includes('tab_box') && text && text.includes('セラピスト'))) {
+                const isVisible = await tabElement.isVisible({ timeout: 2000 }).catch(() => false);
+                if (isVisible) {
+                  logger.info(`セラピストを含むタブ要素が見つかりました: ${text?.substring(0, 30)}`);
+                  await tabElement.scrollIntoViewIfNeeded();
+                  await page.waitForTimeout(500);
+                  try {
+                    await tabElement.click({ timeout: 5000, force: false });
+                  } catch (clickError) {
+                    if (clickError instanceof Error && clickError.message.includes('intercepts')) {
+                      await tabElement.click({ timeout: 5000, force: true });
+                    } else {
+                      throw clickError;
+                    }
+                  }
+                  await page.waitForTimeout(1500);
+                  try {
+                    await page.waitForSelector('[data-detail-tab="therapist"].detail-current, .tab_box.detail-current', { timeout: 5000 });
+                    logger.info(`タブが切り替わりました: therapist`);
+                  } catch {
+                    logger.debug('タブの切り替えを待てませんでしたが、続行します');
+                  }
+                  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+                  const afterUrl = page.url();
+                  logger.logNavigation('タブ要素', afterUrl);
+                  return {
+                    success: true,
+                    message: 'セラピストをクリックしました',
+                    url: afterUrl,
+                  };
+                }
+              }
+            } catch (error) {
+              logger.debug('タブ要素の処理でエラー', error);
+              // 次の要素を試す
+            }
+          }
+        } catch (error) {
+          logger.debug('タブ要素の検索でエラー', error);
+        }
+        
+        logger.warn('data-detail-tab属性を持つ要素が見つかりませんでした。通常のクリック処理を試します');
+        // data-detail-tab属性を持つ要素が見つからない場合、通常のクリック処理を試す
+        const element = page.locator(selector).first();
+        const count = await element.count();
+        if (count > 0) {
+          const isVisible = await element.isVisible({ timeout: 2000 }).catch(() => false);
+          if (isVisible) {
+            await element.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(300);
+            try {
+              await element.click({ timeout: 5000, force: false });
+            } catch (clickError) {
+              if (clickError instanceof Error && clickError.message.includes('intercepts')) {
+                await element.click({ timeout: 5000, force: true });
+              } else {
+                throw clickError;
+              }
+            }
+            await page.waitForTimeout(1000);
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+            const afterUrl = page.url();
+            logger.logNavigation(selector, afterUrl);
+            return {
+              success: true,
+              message: 'セラピストをクリックしました',
+              url: afterUrl,
+            };
+          }
+        }
+        
+        return {
+          success: false,
+          message: 'セラピストの要素が見つかりませんでした',
+        };
+      } catch (error) {
+        logger.error('セラピストの検索エラー', error);
+        return {
+          success: false,
+          message: `エラー: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    },
+  },
+  createClickAction(
+    '料金システム',
+    [
+      'a:has-text("料金システム")',
+      'text=料金システム',
+      '[href*="price"]',
+      '[href*="fee"]',
+      '[href*="system"]',
+      '[data-detail-tab="price"]',
+      'a[data-detail-tab="price"]',
+    ],
+    '料金システムページに遷移'
+  ),
+  createClickAction(
+    '割引情報',
+    [
+      'a:has-text("割引情報")',
+      'text=割引情報',
+      '[href*="discount"]',
+      '[href*="coupon"]',
+      '[data-detail-tab="coupon"]',
+      'a[data-detail-tab="coupon"]',
+    ],
+    '割引情報ページに遷移'
+  ),
+  createClickAction(
+    'ニュース',
+    [
+      '[data-detail-tab="news"]',
+      'a[data-detail-tab="news"]',
+      'a.tab_box[data-detail-tab="news"]',
+      '.tab_box[data-detail-tab="news"]',
+      'text=ニュース',
+      'a:has-text("ニュース")',
+      '[href*="news"]',
+    ],
+    'ニュースページに遷移（タブ切り替え）'
+  ),
+  createClickAction(
+    'セラピスト動画',
+    [
+      'a:has-text("セラピスト動画")',
+      'text=セラピスト動画',
+      '[href*="video"]',
+      '[href*="movie"]',
+    ],
+    'セラピスト動画ページに遷移'
+  ),
+  createClickAction(
+    'アクセス',
+    [
+      'a:has-text("アクセス")',
+      'text=アクセス',
+      '[href*="access"]',
+      '[data-detail-tab="access"]',
+      'a[data-detail-tab="access"]',
+    ],
+    'アクセスページに遷移'
   ),
   createClickAction(
     'セラピスト動画',
