@@ -5,6 +5,10 @@ dist/
 playwright-report/
 test-results/
 .env
+.env.local
+.env.*.local
 *.screenshot.png
+config/proxy.json
+SETUP_GUIDE.md
 
 
