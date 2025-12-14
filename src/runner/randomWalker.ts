@@ -4,6 +4,7 @@ import { getActionsForPage, isActionExecutable } from '../actions/actionRegistry
 import { randomChoice, shuffle, randomWaitTime } from '../utils/random';
 import { logger } from '../utils/logger';
 import { BrowserLauncher } from '../browser/launcher';
+import { getCurrentIP, checkIPChange } from '../utils/ipChecker';
 
 export interface WalkerConfig {
   /** 最大ステップ数 */
@@ -18,6 +19,8 @@ export interface WalkerConfig {
   maxVisitedUrls?: number;
   /** スクリーンショット保存ディレクトリ */
   screenshotDir?: string;
+  /** プロキシをローテーションする間隔（ステップ数、0の場合はローテーションしない） */
+  proxyRotationInterval?: number;
 }
 
 const DEFAULT_CONFIG: Required<WalkerConfig> = {
@@ -27,6 +30,7 @@ const DEFAULT_CONFIG: Required<WalkerConfig> = {
   randomOrder: true,
   maxVisitedUrls: 20,
   screenshotDir: './screenshots',
+  proxyRotationInterval: 0, // デフォルトではローテーションしない
 };
 
 export class RandomWalker {
@@ -36,6 +40,10 @@ export class RandomWalker {
   private launcher: BrowserLauncher;
   /** ページごとの実行済みアクションを追跡（URL -> 実行済みアクション名のSet） */
   private executedActionsByPage: Map<string, Set<string>> = new Map();
+  /** 現在のIPアドレス */
+  private currentIP: string | null = null;
+  /** 開始URL（プロキシローテーション後のフォールバック用） */
+  private startUrl: string = '';
 
   constructor(launcher: BrowserLauncher, config: WalkerConfig = {}) {
     this.launcher = launcher;
@@ -57,6 +65,16 @@ export class RandomWalker {
       await this.launcher.navigate(startUrl);
       this.visitedUrls.add(startUrl);
       this.stepCount = 0;
+      this.startUrl = startUrl; // startUrlを保存（プロキシローテーション後のフォールバック用）
+      
+      // 初期IPアドレスを確認
+      const page = this.launcher.getPage();
+      this.currentIP = await getCurrentIP(page);
+      if (this.currentIP) {
+        logger.info(`=== 初期IPアドレス: ${this.currentIP} ===`);
+      } else {
+        logger.warn('初期IPアドレスの取得に失敗しました');
+      }
 
       // 回遊ループ
       while (this.stepCount < this.config.maxSteps) {
@@ -149,6 +167,78 @@ export class RandomWalker {
             this.executedActionsByPage.set(baseUrl, new Set());
           }
           this.executedActionsByPage.get(baseUrl)!.add(selectedAction.name);
+          
+          // プロキシローテーション（設定されている場合）
+          if (this.config.proxyRotationInterval > 0 && this.stepCount % this.config.proxyRotationInterval === 0) {
+            try {
+              const previousIP = this.currentIP;
+              const currentUrlBeforeRotation = page.url(); // 現在のURLを保存
+              
+              // プロキシローテーション設定がある場合は、次のプロキシに切り替え
+              if (this.launcher.hasProxyRotationConfig()) {
+                this.launcher.rotateProxy();
+              }
+              
+              // プロキシローテーション設定がない場合でも、新しいコンテキストを作成することでIPが変わる可能性がある
+              // （iproyalなどのプロキシサービスでは、同じエンドポイントでも接続ごとに異なるIPが割り当てられることがある）
+              await this.launcher.createNewContext();
+              logger.info(`プロキシコンテキストを再作成しました（ステップ: ${this.stepCount}）`);
+              
+              // 新しいコンテキストが完全に準備できるまで少し待機
+              const newPage = this.launcher.getPage();
+              await newPage.waitForTimeout(2000); // 待機時間を延長
+              
+              // IPアドレスの変更を確認
+              let ipCheckResult = await checkIPChange(newPage, previousIP);
+              this.currentIP = ipCheckResult.currentIP;
+              
+              // IP確認が失敗した場合、リトライ
+              if (!this.currentIP) {
+                logger.debug('IP確認をリトライします...');
+                await newPage.waitForTimeout(2000);
+                ipCheckResult = await checkIPChange(newPage, previousIP);
+                this.currentIP = ipCheckResult.currentIP;
+              }
+              
+              // 元のURLに戻る（新しいページは初期状態でabout:blankになっているため、必ず遷移する）
+              if (currentUrlBeforeRotation && currentUrlBeforeRotation !== 'about:blank' && !currentUrlBeforeRotation.startsWith('chrome-error://')) {
+                try {
+                  // 新しいページのURLを確認（通常はabout:blank）
+                  const currentPageUrl = newPage.url();
+                  if (currentPageUrl === 'about:blank') {
+                    logger.debug(`新しいコンテキストの初期状態（about:blank）から元のURLに戻ります: ${currentUrlBeforeRotation}`);
+                  }
+                  
+                  // 元のURLに戻る
+                  await this.launcher.navigate(currentUrlBeforeRotation);
+                  logger.debug(`プロキシローテーション後、元のURLに戻りました: ${currentUrlBeforeRotation}`);
+                } catch (navError) {
+                  logger.error('プロキシローテーション後、元のURLに戻れませんでした', navError);
+                  // エラーが発生した場合、startUrlに戻る
+                  try {
+                    await this.launcher.navigate(this.startUrl);
+                    logger.info(`エラー回避のため、開始URLに戻りました: ${this.startUrl}`);
+                  } catch (fallbackError) {
+                    logger.error('開始URLへの遷移も失敗しました', fallbackError);
+                    // これ以上続行できない場合は、エラーをスロー
+                    throw new Error('プロキシローテーション後のURL遷移に失敗しました');
+                  }
+                }
+              }
+              
+              // IPアドレスの変更結果をログ出力
+              if (ipCheckResult.changed) {
+                logger.info(`✅ [IP変更確認] ステップ${this.stepCount}: ${previousIP} → ${this.currentIP}`);
+              } else if (this.currentIP) {
+                logger.info(`[IP確認] ステップ${this.stepCount}: IPアドレスは変更されていません (${this.currentIP})`);
+              } else {
+                logger.warn('IPアドレスの取得に失敗しました（プロキシローテーション直後）');
+              }
+            } catch (error) {
+              logger.warn('プロキシのローテーションに失敗しました', error);
+              // エラーが発生しても処理を続行
+            }
+          }
           
           // URLが変更された場合、訪問済みURLに追加
           if (result.url && result.url !== currentUrl) {

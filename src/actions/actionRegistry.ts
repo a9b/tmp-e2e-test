@@ -128,20 +128,36 @@ function createClickAction(
         
         
         // クリック実行
+        let clickSucceeded = false;
         try {
           await element.click({ timeout: 5000, force: false });
+          clickSucceeded = true;
         } catch (clickError) {
           // クリックが失敗した場合、forceオプションで再試行
           if (clickError instanceof Error && clickError.message.includes('intercepts')) {
             logger.debug('要素が他の要素に隠れています。forceオプションで再試行します');
-            await element.click({ timeout: 5000, force: true });
+            try {
+              await element.click({ timeout: 5000, force: true });
+              clickSucceeded = true;
+            } catch (forceError) {
+              // forceクリックも失敗した場合、タイムアウトの可能性を確認
+              if (forceError instanceof Error && (forceError.message.includes('Timeout') || forceError.message.includes('exceeded'))) {
+                logger.warn(`クリックがタイムアウトしましたが、処理を続行します: ${name}`, { error: forceError.message });
+                // タイムアウトでも処理を続行（URLの変更を確認するため）
+              } else {
+                throw forceError;
+              }
+            }
+          } else if (clickError instanceof Error && (clickError.message.includes('Timeout') || clickError.message.includes('exceeded'))) {
+            // タイムアウトエラーの場合、処理を続行
+            logger.warn(`クリックがタイムアウトしましたが、処理を続行します: ${name}`, { error: clickError.message });
           } else {
             throw clickError;
           }
         }
         
-        // ページ遷移を待機
-        await page.waitForTimeout(1000); // 遷移を待つ
+        // ページ遷移を待機（タイムアウトした場合でも少し待つ）
+        await page.waitForTimeout(clickSucceeded ? 1000 : 2000); // タイムアウトした場合は少し長めに待つ
         
         // タブ切り替えの場合は、タブがアクティブになるまで待機
         if (isTabSwitch) {
@@ -153,11 +169,34 @@ function createClickAction(
           }
         }
         
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
-          // ネットワークアイドルを待てない場合は無視
-        });
-
+        // URLの変更を確認（タイムアウトした場合でも、遷移が完了している可能性がある）
         const afterUrl = page.url();
+        const urlChanged = beforeUrl !== afterUrl;
+        
+        // タイムアウトした場合でも、URLが変更されていれば成功として扱う
+        if (!clickSucceeded && urlChanged) {
+          logger.info(`クリックはタイムアウトしましたが、URLが変更されたため成功として扱います: ${name}`, {
+            beforeUrl,
+            afterUrl
+          });
+          await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+          logger.logNavigation(selector, afterUrl);
+          return {
+            success: true,
+            message: `${name}をクリックしました（タイムアウト後もURL変更を確認）`,
+            url: afterUrl,
+          };
+        }
+        
+        // 通常の処理（クリックが成功した場合）
+        if (clickSucceeded) {
+          await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
+            // ネットワークアイドルを待てない場合は無視
+          });
+        } else {
+          // タイムアウトした場合でも、最低限の待機
+          await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+        }
         
         // URLが変わったか確認（タブ切り替えの場合はURLが変わらないこともある）
         if (beforeUrl === afterUrl && name !== '店舗トップ' && !isTabSwitch) {
@@ -166,6 +205,25 @@ function createClickAction(
         }
         
         logger.logNavigation(selector, afterUrl);
+
+        // タイムアウトした場合でも、URLが変更されていれば成功として扱う
+        if (!clickSucceeded && urlChanged) {
+          return {
+            success: true,
+            message: `${name}をクリックしました（タイムアウト後もURL変更を確認）`,
+            url: afterUrl,
+          };
+        }
+        
+        // タイムアウトしてURLも変更されていない場合
+        if (!clickSucceeded && !urlChanged) {
+          logger.warn(`クリックがタイムアウトし、URLも変更されませんでした: ${name}`, { beforeUrl, afterUrl });
+          return {
+            success: false,
+            message: `クリックがタイムアウトしました: ${name}`,
+            url: afterUrl,
+          };
+        }
 
         return {
           success: true,
@@ -470,9 +528,12 @@ export const monroeShopActions: Action[] = [
               
               logger.debug(`タブ要素: text=${text?.substring(0, 20)}, data-detail-tab=${dataAttr}, class=${classAttr}`);
               
-              if ((text && (text.includes('セラピスト') || text.includes('therapist'))) || 
-                  dataAttr === 'therapist' ||
-                  (classAttr && classAttr.includes('tab_box') && text && text.includes('セラピスト'))) {
+              // 「セラピスト」を含むが、「セラピスト動画」ではない要素を探す
+              const isTherapist = (text && text.includes('セラピスト') && !text.includes('セラピスト動画') && !text.includes('動画')) ||
+                                  dataAttr === 'therapist' ||
+                                  (classAttr && classAttr.includes('tab_box') && text && text.includes('セラピスト') && !text.includes('セラピスト動画') && !text.includes('動画'));
+              
+              if (isTherapist) {
                 const isVisible = await tabElement.isVisible({ timeout: 2000 }).catch(() => false);
                 if (isVisible) {
                   logger.info(`セラピストを含むタブ要素が見つかりました: ${text?.substring(0, 30)}`);
@@ -614,45 +675,6 @@ export const monroeShopActions: Action[] = [
       'a[data-detail-tab="access"]',
     ],
     'アクセスページに遷移'
-  ),
-  createClickAction(
-    'セラピスト動画',
-    [
-      'a:has-text("セラピスト動画")',
-      'text=セラピスト動画',
-      '[href*="video"]',
-      '[href*="movie"]',
-    ],
-    'セラピスト動画ページに遷移'
-  ),
-  createClickAction(
-    '料金システム',
-    [
-      'a:has-text("料金システム")',
-      'text=料金システム',
-      '[href*="price"]',
-      '[href*="fee"]',
-    ],
-    '料金システムページに遷移'
-  ),
-  createClickAction(
-    'アクセス',
-    [
-      'a:has-text("アクセス")',
-      'text=アクセス',
-      '[href*="access"]',
-    ],
-    'アクセスページに遷移'
-  ),
-  createClickAction(
-    '割引情報',
-    [
-      'a:has-text("割引情報")',
-      'text=割引情報',
-      '[href*="discount"]',
-      '[href*="coupon"]',
-    ],
-    '割引情報ページに遷移'
   ),
   createClickAction(
     'ネット予約',

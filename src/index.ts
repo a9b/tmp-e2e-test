@@ -1,3 +1,7 @@
+// .envファイルを読み込む（最初に実行）
+import dotenv from 'dotenv';
+dotenv.config();
+
 import { BrowserLauncher } from './browser/launcher';
 import { RandomWalker } from './runner/randomWalker';
 import { logger } from './utils/logger';
@@ -30,7 +34,11 @@ async function main() {
       width: 1920,
       height: 1080,
     },
+    // プロキシ設定は環境変数から自動的に読み込まれます
   });
+
+  // プロキシローテーション間隔（環境変数から読み込み、0の場合はローテーションしない）
+  const proxyRotationInterval = parseInt(process.env.PROXY_ROTATION_INTERVAL || '0', 10);
 
   const walker = new RandomWalker(launcher, {
     maxSteps,
@@ -39,6 +47,7 @@ async function main() {
     randomOrder,
     maxVisitedUrls: 20,
     screenshotDir: './screenshots',
+    proxyRotationInterval,
   });
 
   try {

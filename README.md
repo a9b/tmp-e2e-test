@@ -24,6 +24,11 @@ npm install
 
 # Playwrightブラウザのインストール
 npx playwright install chromium
+
+# プロキシを使用する場合（オプション）
+# .env.exampleをコピーして.envを作成し、プロキシ設定を追加
+cp .env.example .env
+# .envファイルを編集してプロキシ情報を設定
 ```
 
 ## 使用方法
@@ -113,6 +118,33 @@ export const monroeShopActions: Action[] = [
 - `viewport`: ビューポートサイズ（デフォルト: 1920x1080）
 - `userAgent`: ユーザーエージェント
 - `timeout`: タイムアウト（ミリ秒、デフォルト: 30000）
+
+### プロキシ設定（オプション）
+
+`.env`ファイルに以下の環境変数を設定することで、プロキシ経由でアクセスできます：
+
+```bash
+# プロキシを使用するかどうか
+USE_PROXY=true
+
+# 単一のプロキシを使用する場合
+PROXY_URL=http://username:password@proxy.example.com:8080
+
+# 複数のプロキシをローテーションする場合
+PROXY_URLS=http://user1:pass1@proxy1.com:8080,http://user2:pass2@proxy2.com:8080
+PROXY_ROTATION=random  # random または sequential
+
+# プロキシをローテーションする間隔（ステップ数、0の場合はローテーションしない）
+PROXY_ROTATION_INTERVAL=10
+```
+
+**注意:** `.env`ファイルは`.gitignore`に含まれているため、機密情報を安全に管理できます。
+
+**プロキシローテーションの動作:**
+- `PROXY_ROTATION_INTERVAL`を設定すると、指定したステップ数ごとに自動的にプロキシが切り替わります
+- 例: `PROXY_ROTATION_INTERVAL=10` の場合、10ステップごとにプロキシがローテーションされます
+- `PROXY_ROTATION=random` の場合、ランダムにプロキシが選択されます
+- `PROXY_ROTATION=sequential` の場合、順番にプロキシが選択されます
 
 ## 拡張性
 
